@@ -1,0 +1,71 @@
+name: Independent Lean 4 verification
+on:
+  push:
+    branches: [verify/lean4-20260928]
+  workflow_dispatch:
+permissions:
+  contents: read
+jobs:
+  verify:
+    runs-on: ubuntu-24.04
+    timeout-minutes: 90
+    env:
+      LEAN_NUM_THREADS: "2"
+    defaults:
+      run:
+        shell: bash
+    steps:
+      - uses: actions/checkout@v4
+      - name: Install pinned Lean release
+        run: |
+          set -euo pipefail
+          test "$(cat lean-toolchain)" = "leanprover/lean4:v4.34.0"
+          curl --fail --location --retry 3 https://github.com/leanprover/lean4/releases/download/v4.34.0/lean-4.34.0-linux.tar.zst -o "$RUNNER_TEMP/lean.tar.zst"
+          tar --no-same-owner --zstd -xf "$RUNNER_TEMP/lean.tar.zst" -C "$RUNNER_TEMP"
+          echo "$RUNNER_TEMP/lean-4.34.0-linux/bin" >> "$GITHUB_PATH"
+      - name: Record environment
+        run: |
+          mkdir -p verification-logs
+          { git rev-parse HEAD; lean --version; lake --version; } | tee verification-logs/environment.log
+      - name: Fetch pinned dependencies and cache
+        run: |
+          set -euo pipefail
+          lake exe cache get 2>&1 | tee verification-logs/cache.log
+          git diff --exit-code -- lean-toolchain lakefile.toml lake-manifest.json
+      - name: Build mathematical target
+        run: |
+          set -euo pipefail
+          lake build 2>&1 | tee verification-logs/mathematics-build.log
+      - name: Check mathematical axioms
+        run: |
+          set -euo pipefail
+          lake env lean Verification/Layer1_Mathematics.lean 2>&1 | tee verification-logs/mathematics-axioms.log
+      - name: Build separate certificates
+        run: |
+          set -euo pipefail
+          lake build NavaRobertsonCertificados 2>&1 | tee verification-logs/certificates-build.log
+      - name: Check certificate axioms
+        run: |
+          set -euo pipefail
+          lake env lean Verification/Certificados.lean 2>&1 | tee verification-logs/certificates-axioms.log
+      - name: Reject unexpected axioms
+        run: |
+          python3 - <<'PY'
+          import pathlib, re
+          allowed = {"propext", "Classical.choice", "Quot.sound"}
+          for filename in ("mathematics-axioms.log", "certificates-axioms.log"):
+              text = (pathlib.Path("verification-logs") / filename).read_text()
+              groups = re.findall(r"depends on axioms:\s*\[([^\]]*)\]", text)
+              assert groups, f"No axiom reports found in {filename}"
+              for group in groups:
+                  found = {item.strip() for item in group.split(",") if item.strip()}
+                  assert found <= allowed, f"Unexpected axioms in {filename}: {found - allowed}"
+              print(f"{filename}: {len(groups)} axiom reports checked")
+          PY
+      - name: Preserve verification logs
+        if: always()
+        uses: actions/upload-artifact@v4
+        with:
+          name: lean4-verification-logs
+          path: verification-logs/
+          retention-days: 30
